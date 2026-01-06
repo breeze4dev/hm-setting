@@ -8,7 +8,6 @@
 
 - 电脑: Chrome/Edge
 - Android: Chrome/Edge
-- iOS: Bluefy 浏览器
 
 ### 使用方法
 

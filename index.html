@@ -131,6 +131,38 @@
       transform: scale(1.05);
       text-decoration: none;
     }
+
+    .info-collapsible {
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease-out;
+    }
+
+    .info-collapsible.expanded {
+      max-height: 1000px;
+      transition: max-height 0.3s ease-in;
+    }
+
+    .info-toggle-btn {
+      background: rgba(13, 110, 253, 0.1);
+      border: 1px solid rgba(13, 110, 253, 0.3);
+      color: #0d6efd;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      margin-top: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .info-toggle-btn:hover {
+      background: rgba(13, 110, 253, 0.2);
+      border-color: rgba(13, 110, 253, 0.4);
+    }
   </style>
 </head>
 
@@ -138,9 +170,30 @@
   <div class="w-full max-w-4xl">
     <!-- 信息提示框 -->
     <div class="info-notice">
-      <div class="info-content">
-        <span class="info-text">为了省电，固件每隔整十分钟广播一次，持续半分钟。广播时，屏幕会显示蓝牙图标和设备名的后缀。此时点击页面上的"连接"按钮，在弹出的页面选择对应的设备即可连接上。再点"对时"按钮完成对时。具体源码请访问原作者项目:</span>
-        <a href="https://github.com/tpunix/HMCLOCK" class="info-link" target="_blank" rel="noopener noreferrer">github</a>
+      <div class="info-content" style="flex-direction: column; align-items: flex-start; gap: 12px; width: 100%;">
+        <div>
+          <span class="info-text" style="font-weight: 600; display: block; margin-bottom: 4px;">不要用手机或电脑设置中的蓝牙连接设备，而是直接使用此网页上的"连接设备"按钮进行连接。 设备首次通电后可以立即进行连接，之后为了省电蓝牙会每隔十分钟开启30秒，当蓝牙开启时屏幕会显示蓝牙图标和设备名的后缀。此时点击页面上的"连接"按钮，在弹出的页面选择对应的设备即可连接上。再点"对时"按钮完成对时。</span>
+        </div>
+        <div class="info-collapsible" id="info-collapsible">
+          <div style="display: flex; flex-direction: column; gap: 12px;">
+            <div>
+              <span class="info-text" style="font-weight: 600; display: block; margin-bottom: 4px;">支持浏览器：</span>
+              <span class="info-text">电脑: Chrome/Edge | Android: Chrome/Edge</span>
+            </div>
+            <div>
+              <span class="info-text" style="font-weight: 600; display: block; margin-bottom: 4px;">时钟校准：</span>
+              <span class="info-text">时钟大概每天会快两秒左右。通过微调定时器的间隔，可以让时钟更精确。设备链接后，按"时间校准"按钮，然后等待一分钟左右（观察日志提示），校准后请立即做一次时间同步。在时间同步后，间隔两到三周，再做两次校准，基本上就可以让时钟精准运行了。</span>
+            </div>
+            <div>
+              <span class="info-text">具体源码请访问原作者项目:</span>
+              <a href="https://github.com/tpunix/HMCLOCK" class="info-link" target="_blank" rel="noopener noreferrer">github</a>
+            </div>
+          </div>
+        </div>
+        <button class="info-toggle-btn" id="info-toggle-btn" onclick="toggleInfoNotice()">
+          <i class="fa fa-chevron-down" id="info-toggle-icon"></i>
+          <span id="info-toggle-text">展开详情</span>
+        </button>
       </div>
     </div>
 
@@ -249,6 +302,25 @@
   <script src="https://cdn.sheetjs.com/crc-32-latest/package/crc32.js"></script>
   
   <script>
+    // 信息提示框折叠功能
+    function toggleInfoNotice() {
+      const collapsible = document.getElementById('info-collapsible');
+      const toggleIcon = document.getElementById('info-toggle-icon');
+      const toggleText = document.getElementById('info-toggle-text');
+      
+      if (collapsible.classList.contains('expanded')) {
+        collapsible.classList.remove('expanded');
+        toggleIcon.classList.remove('fa-chevron-up');
+        toggleIcon.classList.add('fa-chevron-down');
+        toggleText.textContent = '展开详情';
+      } else {
+        collapsible.classList.add('expanded');
+        toggleIcon.classList.remove('fa-chevron-down');
+        toggleIcon.classList.add('fa-chevron-up');
+        toggleText.textContent = '收起详情';
+      }
+    }
+
     // 系统时间更新
     function updateSystemTime() {
       const now = new Date();
