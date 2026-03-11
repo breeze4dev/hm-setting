@@ -245,7 +245,7 @@
           </div>
         </div>
         
-        <div class="flex items-center gap-3">
+        <div id="device_time_block" class="flex items-center gap-3 hidden">
           <div class="w-10 h-10 rounded-full bg-secondary/10 flex items-center justify-center text-secondary">
             <i class="fa fa-calendar"></i>
           </div>
@@ -399,8 +399,198 @@
     var connected = false;
     var device = null;
     var longValue = null;
-    var deviceTimeInterval = null; // 设备时间更新定时器
-    var deviceTimeBase = null;     // 设备时间基准值
+    var deviceTimeInterval = null; // device time update timer
+    var deviceTimeBase = null;     // device time base for display
+    var _waitingForClockTransition = false;
+    var _clockTransitionLastMinute = null;
+
+    const SVC_FF00 = '0000ff00-0000-1000-8000-00805f9b34fb';
+    const CHAR_FF01 = '0000ff01-0000-1000-8000-00805f9b34fb';
+    const CHAR_FF02 = '0000ff02-0000-1000-8000-00805f9b34fb';
+    const CHAR_FF03 = '0000ff03-0000-1000-8000-00805f9b34fb';
+
+    // OTA ACK (new firmware): [0xA5, status, pageLo, pageHi]
+    let _otaAckLastPage = 0;
+    let _otaAckWaitPage = 0;
+    let _otaAckWaitResolve = null;
+    let _otaAckWaitTimer = null;
+    let _lastLongValueFromNotify = null;
+
+    function _clearOtaAckWaiter() {
+      _otaAckWaitPage = 0;
+      _otaAckWaitResolve = null;
+      if (_otaAckWaitTimer) {
+        clearTimeout(_otaAckWaitTimer);
+        _otaAckWaitTimer = null;
+      }
+    }
+
+    function _handleLongValueChanged(ev) {
+      try {
+        const v = ev && ev.target && ev.target.value;
+        if (!v || v.byteLength < 4) return;
+        const b0 = v.getUint8(0);
+        if (b0 === 0xA5) {
+          const status = v.getUint8(1);
+          const page = v.getUint8(2) | (v.getUint8(3) << 8);
+          if (status !== 0) return;
+          if (page > _otaAckLastPage) _otaAckLastPage = page;
+          if (_otaAckWaitResolve && page >= _otaAckWaitPage) {
+            const r = _otaAckWaitResolve;
+            _clearOtaAckWaiter();
+            r(true);
+          }
+          return;
+        }
+        if (v.byteLength >= 7 && connected && longValue) {
+          _lastLongValueFromNotify = v.buffer.slice(0, Math.min(11, v.buffer.byteLength));
+          if (_waitingForClockTransition) {
+            const minute = v.getUint8(5);
+            if (_clockTransitionLastMinute === null) {
+              _clockTransitionLastMinute = minute;
+            } else if (minute !== _clockTransitionLastMinute) {
+              const year = v.getUint16(0, true);
+              const month = v.getUint8(2);
+              const mday = v.getUint8(3);
+              const hour = v.getUint8(4);
+              const second = v.getUint8(6);
+              deviceTimeBase = { year, month, mday, hour, minute, second, timestamp: new Date() };
+              updateDeviceTime();
+              if (deviceTimeInterval) clearInterval(deviceTimeInterval);
+              deviceTimeInterval = setInterval(updateDeviceTime, 1000);
+              setDeviceTimeVisible(true);
+              _waitingForClockTransition = false;
+              _clockTransitionLastMinute = null;
+              console.log('Device time from notify (minute changed)');
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    function waitOtaAck(page, timeoutMs) {
+      if (_otaAckLastPage >= page) return Promise.resolve(true);
+      _clearOtaAckWaiter();
+      _otaAckWaitPage = page;
+      return new Promise((resolve) => {
+        _otaAckWaitResolve = resolve;
+        _otaAckWaitTimer = setTimeout(() => {
+          if (_otaAckWaitResolve) {
+            _clearOtaAckWaiter();
+            resolve(false);
+          }
+        }, timeoutMs);
+      });
+    }
+
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    function getLongValueFromCache(minLength) {
+      if (!_lastLongValueFromNotify || _lastLongValueFromNotify.byteLength < minLength) return null;
+      return new DataView(_lastLongValueFromNotify.slice(0, _lastLongValueFromNotify.byteLength));
+    }
+
+    async function readLongValueWithRetry(minLength, maxRetries, delayMs) {
+      minLength = minLength || 7;
+      maxRetries = maxRetries != null ? maxRetries : 5;
+      delayMs = delayMs != null ? delayMs : 500;
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const cur = await longValue.readValue();
+          if (cur && cur.buffer && cur.buffer.byteLength >= minLength) return cur;
+        } catch (_) {}
+        await sleep(delayMs);
+      }
+      return getLongValueFromCache(minLength);
+    }
+
+    function setDeviceTimeVisible(visible) {
+      const el = document.getElementById('device_time_block');
+      if (!el) return;
+      if (visible) el.classList.remove('hidden');
+      else el.classList.add('hidden');
+    }
+
+    function clearDeviceTime() {
+      deviceTimeBase = null;
+      _waitingForClockTransition = false;
+      _clockTransitionLastMinute = null;
+      if (deviceTimeInterval) {
+        clearInterval(deviceTimeInterval);
+        deviceTimeInterval = null;
+      }
+      document.getElementById('current_time').textContent = '--:--:--';
+      setDeviceTimeVisible(false);
+    }
+
+    async function waitForClockTransition() {
+      if (!longValue || !connected) return;
+      _waitingForClockTransition = true;
+      _clockTransitionLastMinute = null;
+      await sleep(300);
+      let lastMinute = null;
+      const deadline = Date.now() + 70000;
+      let shortReadCount = 0;
+      console.log('等待设备时间跳变...');
+      while (Date.now() < deadline && connected && longValue) {
+        if (!_waitingForClockTransition) return;
+        await sleep(500);
+        try {
+          let cur = await longValue.readValue();
+          let fromRead = cur && cur.buffer && cur.buffer.byteLength >= 7;
+          if (!fromRead) cur = getLongValueFromCache(7);
+          const len = cur && cur.buffer ? cur.buffer.byteLength : 0;
+          if (len < 7) {
+            if (len > 0) {
+              shortReadCount++;
+              if (shortReadCount === 6) console.log('未读取到时间: ' + len + ' 字节');
+            }
+            continue;
+          }
+          shortReadCount = 0;
+          const year = cur.getUint16(0, true);
+          const month = cur.getUint8(2);
+          const mday = cur.getUint8(3);
+          const hour = cur.getUint8(4);
+          const minute = cur.getUint8(5);
+          const second = cur.getUint8(6);
+          if (lastMinute === null) {
+            lastMinute = minute;
+            _clockTransitionLastMinute = minute;
+            continue;
+          }
+          if (minute !== lastMinute) {
+            try {
+              var fresh = await longValue.readValue();
+              if (fresh && fresh.buffer && fresh.buffer.byteLength >= 7) {
+                cur = fresh;
+                year = cur.getUint16(0, true);
+                month = cur.getUint8(2);
+                mday = cur.getUint8(3);
+                hour = cur.getUint8(4);
+                minute = cur.getUint8(5);
+                second = cur.getUint8(6);
+              }
+            } catch (_) {}
+            deviceTimeBase = { year, month, mday, hour, minute, second, timestamp: new Date() };
+            updateDeviceTime();
+            if (deviceTimeInterval) clearInterval(deviceTimeInterval);
+            deviceTimeInterval = setInterval(updateDeviceTime, 1000);
+            setDeviceTimeVisible(true);
+            _waitingForClockTransition = false;
+            console.log('已获取设备时间（分钟跳变）');
+            return;
+          }
+          lastMinute = minute;
+          _clockTransitionLastMinute = minute;
+        } catch (_) {}
+      }
+      _waitingForClockTransition = false;
+      _clockTransitionLastMinute = null;
+      console.log('等待分钟跳变超时，设备时间已隐藏');
+    }
     
     // 格式化时间显示
     function formatTime(year, month, mday, hour, min, sec) {
@@ -437,10 +627,10 @@
       else connectToDevice();
     }
 
-    // 连接设备
     async function connectToDevice() {
       try {
-        // 更新按钮状态
+        clearDeviceTime();
+        // Update button state
         const connectButton = document.getElementById('connect-button');
         connectButton.disabled = true;
         connectButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i> 连接中...';
@@ -448,7 +638,7 @@
         console.log('请求设备...');
         device = await navigator.bluetooth.requestDevice({
           filters: [{ namePrefix: "DLG-CLOCK" }],
-          optionalServices: [ 0xff00 ]
+          optionalServices: [ SVC_FF00 ]
         });
         console.log('设备名称:', device.name);
         document.getElementById('device_name').textContent = device.name;
@@ -457,35 +647,27 @@
         let server = await device.gatt.connect();
         console.log('设备已连接');
 
-        let service = await server.getPrimaryService(0xff00);
-        let ctrlPoint = await service.getCharacteristic(0xff03);
-        let adc1Value = await service.getCharacteristic(0xff02);
-        longValue = await service.getCharacteristic(0xff01);
+        let service = await server.getPrimaryService(SVC_FF00);
+        let ctrlPoint = await service.getCharacteristic(CHAR_FF03);
+        let adc1Value = await service.getCharacteristic(CHAR_FF02);
+        longValue = await service.getCharacteristic(CHAR_FF01);
+
+        clearDeviceTime();
+
+        // Enable notifications if supported (needed for new firmware OTA ACK).
+        try {
+          longValue.addEventListener('characteristicvaluechanged', _handleLongValueChanged);
+          await longValue.startNotifications();
+          console.log('0xff01 Notify 已启用');
+        } catch (e) {
+          console.log('0xff01 Notify 启用失败:', e && e.message);
+        }
 
         let cur_voltage = await adc1Value.readValue();
         console.log('当前电压:', cur_voltage.getUint16(0, true) / 1000 + 'V');
         document.getElementById('current_voltage').textContent = (cur_voltage.getUint16(0, true) / 1000).toFixed(2) + ' V';
 
-        let cur_time = await longValue.readValue();
-        let year = cur_time.getUint16(0, true),
-            month = cur_time.getUint8(2),
-            mday = cur_time.getUint8(3),
-            hour = cur_time.getUint8(4),
-            minute = cur_time.getUint8(5),
-            second = cur_time.getUint8(6);
-        
-        // 保存设备时间基准值和当前时间戳
-        deviceTimeBase = {
-          year, month, mday, hour, minute, second,
-          timestamp: new Date()
-        };
-        
-        // 立即更新设备时间显示
-        updateDeviceTime();
-        
-        // 设置定时器每秒更新一次设备时间
-        if (deviceTimeInterval) clearInterval(deviceTimeInterval);
-        deviceTimeInterval = setInterval(updateDeviceTime, 1000);
+        waitForClockTransition().catch(() => {});
 
         let now = new Date();
         document.getElementById('system_time').textContent = formatTime(
@@ -554,6 +736,9 @@
         
         // 立即更新设备时间显示
         updateDeviceTime();
+        if (deviceTimeInterval) clearInterval(deviceTimeInterval);
+        deviceTimeInterval = setInterval(updateDeviceTime, 1000);
+        setDeviceTimeVisible(true);
         
         console.log('同步时间成功!');
       } catch (error) {
@@ -658,9 +843,20 @@
       const totalSize = firm_size + 64;
       const progressBar = document.getElementById('update_progress_bar');
       const progressText = document.getElementById('update_progress_text');
+
+      // New firmware sends per-page ACK via notifications; old firmware does not.
+      // We probe ACK on the first page and fallback to throttled mode if absent.
+      _otaAckLastPage = 0;
+      _clearOtaAckWaiter();
+      let ackSupported = null; // null: unknown, true/false: decided
+      let ackTimeouts = 0;
+      const ACK_PROBE_TIMEOUT_MS = 700;
+      const ACK_TIMEOUT_MS = 1500;
+      const FALLBACK_PAGE_DELAY_MS = 15;
       
       try {
-        for (let i = 0; i < totalSize; i += 256) {
+        let page = 0;
+        for (let i = 0; i < totalSize; i += 256, page++) {
           buf.fill(0xff);
           if (i === 0) {
             view.setUint32(8, 0x00aa5170, true);
@@ -683,6 +879,19 @@
           await longValue.writeValue(buf);
           sent += 128;
 
+          if (ackSupported !== false) {
+            const ok = await waitOtaAck(page + 1, ackSupported === null ? ACK_PROBE_TIMEOUT_MS : ACK_TIMEOUT_MS);
+            if (ackSupported === null) {
+              ackSupported = ok;
+            } else if (!ok) {
+              ackTimeouts++;
+              if (ackTimeouts >= 3) ackSupported = false;
+            }
+          }
+          if (ackSupported === false) {
+            await sleep(FALLBACK_PAGE_DELAY_MS);
+          }
+
           // 更新进度条
           const progress = Math.min(Math.round(100 * sent / totalSize), 100);
           progressBar.style.width = `${progress}%`;
@@ -690,6 +899,10 @@
           document.getElementById('update_progress').textContent = `升级进度: ${progress}%`;
         }
 
+        // Old firmware (no 0xA5 ACK) may still be writing last page; wait so 0xa4 is not lost
+        if (ackSupported === false) {
+          await sleep(500);
+        }
         buf[0] = 0xa4;
         buf.fill(0, 1, 4);
         await longValue.writeValue(buf);
@@ -704,58 +917,82 @@
     }
 
 	async function onCalibration() {
-		document.getElementById('calibration-button').disabled = true;
+		const btn = document.getElementById('calibration-button');
+		btn.disabled = true;
+		const CAL_MIN_DAYS = 2;
+		const CAL_MIN_MINUTES = CAL_MIN_DAYS * 24 * 60;
+		try {
+			await new Promise(r => setTimeout(r, 300));
+			let cur_time = getLongValueFromCache(11);
+			if (!cur_time || (cur_time.buffer && cur_time.buffer.byteLength < 11)) {
+				cur_time = await readLongValueWithRetry(11, 5, 500);
+			}
+			if (!cur_time || (cur_time.buffer && cur_time.buffer.byteLength < 11)) {
+				cur_time = getLongValueFromCache(11);
+			}
+			const curLen = cur_time && cur_time.buffer ? cur_time.buffer.byteLength : 0;
+			if (!cur_time || curLen < 11) {
+				console.log(curLen > 0 ? '读取到 ' + curLen + ' 字节，需要 11 字节才能校准' : '未读取到校准数据（需要 11 字节）');
+				return;
+			}
+			let last_minute = cur_time.getUint8(5);
+			let cal_minute = cur_time.getInt32(7, true);
+			console.log('对时后已运行: ' + (cal_minute >= 0 ? Math.floor(cal_minute / (24 * 60)) + ' 天' : '未知'));
 
-		var minute, second, last_minute, cal_minute;
-
-		cur_time = await longValue.readValue();
-		last_minute = cur_time.getUint8(5);
-		cal_minute = cur_time.getInt32(7, true);
-		console.log('对时后'+cal_minute+'分钟');
-
-        console.log('等待分钟跳变......');
-        while(true) {
-          cur_time = await longValue.readValue();
-          minute = cur_time.getUint8(5);
-            if(minute != last_minute)
-              break;
-                last_minute = minute;
-        }
-        second = cur_time.getUint8(6);
-
-        var today = new Date();
-        var sys_minute = today.getMinutes();
-        var sys_second = today.getSeconds();
-        console.log('设备时间: '+minute+'分'+second+'秒');
-        console.log('系统时间: '+sys_minute+'分'+sys_second+'秒');
-
-		if(cal_minute==-1){
-			console.log('请先对时!');
-		}else if(cal_minute<2880){
-			console.log('对时与校准间隔太短(小于两天)!');
-		}else{
-
-			if(minute>sys_minute){
-				if(minute-sys_minute>50)
-					sys_minute += 60;
-			}else{
-				if(sys_minute-minute>50)
-					minute += 60;
+			if (cal_minute === -1) {
+				console.log('请先对时，且设备需运行至少 2 天');
+				return;
+			}
+			if (cal_minute < CAL_MIN_MINUTES) {
+				const calDays = Math.floor(cal_minute / (24 * 60));
+				console.log('校准需设备运行至少 2 天（当前约 ' + calDays + ' 天）');
+				return;
 			}
 
-			var diff = (minute*60+second)-(sys_minute*60+sys_second);
-			console.log('时间差: '+diff+'秒');
+			console.log('等待分钟跳变......');
+			while (true) {
+				let cur = await longValue.readValue();
+				let len = cur && cur.buffer ? cur.buffer.byteLength : 0;
+				if (len < 7) cur = getLongValueFromCache(7);
+				len = cur && cur.buffer ? cur.buffer.byteLength : 0;
+				if (cur && len >= 7) {
+					let minute = cur.getUint8(5);
+					if (minute !== last_minute) {
+						cur_time = cur;
+						break;
+					}
+					last_minute = minute;
+				}
+				await new Promise(r => setTimeout(r, 500));
+			}
+			let minute = cur_time.getUint8(5);
+			let second = cur_time.getUint8(6);
 
-			var buf = new Uint8Array(4);
+			let today = new Date();
+			let sys_minute = today.getMinutes();
+			let sys_second = today.getSeconds();
+			console.log('设备时间: ' + minute + '分' + second + '秒');
+			console.log('系统时间: ' + sys_minute + '分' + sys_second + '秒');
+
+			if (minute > sys_minute && minute - sys_minute > 50) sys_minute += 60;
+			else if (sys_minute > minute && sys_minute - minute > 50) minute += 60;
+			let diff = (minute * 60 + second) - (sys_minute * 60 + sys_second);
+			console.log('时间差: ' + diff + '秒');
+
+			let buf = new Uint8Array(4);
 			buf[0] = 0x92;
-			buf[1] = diff%256;
-			buf[2] = diff/256;
+			buf[1] = diff & 0xff;
+			buf[2] = (diff >> 8) & 0xff;
 			buf[3] = 0x00;
 			await longValue.writeValue(buf);
-
 			console.log('校准完成');
+			clearDeviceTime();
+			waitForClockTransition().catch(function() {});
+		} catch (e) {
+			console.log('校准失败:', e);
+		} finally {
+			btn.disabled = false;
 		}
-		document.getElementById('calibration-button').disabled = false;
 	}
 
     // 断开连接
@@ -788,6 +1025,16 @@
 
     // 断开回调
     function onDisconnect() {
+      try {
+        if (longValue) {
+          longValue.removeEventListener('characteristicvaluechanged', _handleLongValueChanged);
+        }
+      } catch (_) {}
+      longValue = null;
+      _otaAckLastPage = 0;
+      _clearOtaAckWaiter();
+      clearDeviceTime();
+
       device = null;
       connected = false;
       
